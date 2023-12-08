@@ -4,11 +4,15 @@
 (use-modules (system foreign-library))
 (use-modules (rnrs bytevectors))
 (use-modules (ice-9 iconv))
+(use-modules (ice-9 string-fun))
 
 (export
   sqlite3-open
   sqlite3-close
-  sqlite3-execute)
+  sqlite3-execute-sql
+  sqlite3-execute-select
+  sqlite3-select-sql-pars
+  sqlite3-save-record)
 
 ; SQLITE_* constants copied from sqlite3.h
 (define SQLITE_OK           0)   ; Successful result
@@ -141,13 +145,6 @@
     #:return-type int
     #:arg-types (list '* int '* int '*)))
 
-(define d
-  (lambda args
-    (for-each
-      (lambda (arg) (display arg)(display " "))
-      args)
-    (newline)))
-
 (define (sqlite3-open path)
   (define pp-db (bytevector->pointer (make-bytevector pointer-size)))
   (define ret
@@ -165,7 +162,7 @@
 
 (define (handle-error db code)
   (define msg (pointer->string (foreign-sqlite3-errmsg db)))
-  (d msg)
+  (display msg)(newline)
   (raise-exception
     (string-append "Error: " msg)))
 
@@ -189,9 +186,9 @@
         (loop (1+ i) (cons (sqlite3-col-val p-stmt i) row))
         (reverse row)))))
 
-(define sqlite3-execute
+(define sqlite3-execute-sql
   (case-lambda
-    ((db sql) (sqlite3-execute db sql '()))
+    ((db sql) (sqlite3-execute-sql db sql '()))
     ((db sql pars)
       (define pp-stmt (bytevector->pointer (make-bytevector pointer-size)))
       (let (
@@ -207,7 +204,7 @@
         (when (not (null? pars))
           (let ((par (car pars)))
             (cond
-              ((null? par)
+              ((eq? par #f)
                (foreign-sqlite3-bind-null p-stmt pari))
               ((integer? par)
                (foreign-sqlite3-bind-int p-stmt pari par))
@@ -220,7 +217,7 @@
                    (bytevector->pointer par-encoded)
                    (bytevector-length par-encoded) %null-pointer)))
               (else
-                (raise (list "Unexpected parameter type")))))
+                (raise (list "Unexpected parameter type" par)))))
           (loop (cdr pars) (1+ pari))))
       (let loop ((rows '()))
         (define ret (foreign-sqlite3-step p-stmt))
@@ -235,12 +232,86 @@
           ((= ret SQLITE_ERROR) (handle-error db ret))
           (else (raise (list "Error in foreign-sqlite3-step" ret))))))))
 
-(define (display-strings pointer len)
-  ; Display an array of pointers to strings.
-  (let loop ((i 0))
-    (when (< i len)
-      (let (
-          (address (+ (pointer-address pointer) (* i pointer-size))))
-        (d (pointer->string (dereference-pointer (make-pointer address)))))
-      (loop (1+ i)))))
+(define (sql-where-clause-single-pair pair)
+  (string-join
+    (list (symbol->string (car pair)) "=" "?")
+    " "))
+
+(define (sql-where-clause where)
+  (string-join
+    (map
+      sql-where-clause-single-pair
+      where)
+    " and "))
+
+(define (sqlite3-select-sql-pars table fields where)
+  (define sql
+    (string-replace-substring
+      (string-replace-substring
+        (string-replace-substring
+          "select {fields}
+          from {table}
+          {where}"
+          "{table}" table)
+        "{where}"
+        (if
+          (null? where) ""
+          (string-append "where " (sql-where-clause where))))
+      "{fields}"
+      (string-join (map symbol->string fields) ", ")))
+  (list sql (map cdr where)))
+
+(define sqlite3-execute-select 
+  (case-lambda 
+    ((db table fields make-record-proc)
+     (sqlite3-execute-select db table fields make-record-proc '()))
+    ((db table fields make-record-proc where)
+     (sqlite3-execute-select db table fields make-record-proc where 0))
+    ((db table fields make-record-proc where limit)
+      (map
+        (lambda (vals) (apply make-record-proc vals))
+        (apply sqlite3-execute-sql db
+          (sqlite3-select-sql-pars table fields where))))))
+
+(define (sql-insert-col-list fields)
+  (string-append
+    "("
+    (string-join
+      (map symbol->string fields)
+      ", ")
+    ")"))
+
+(define (sql-insert-placeholders-list fields)
+  (string-append
+    "("
+    (string-join
+      (map (lambda (_) "?") fields)
+      ", ")
+    ")"))
+
+(define (pars-list record)
+  (let ((rtd (record-type-descriptor record)))
+    (map
+      (lambda (field)
+        ((record-accessor rtd field) record))
+      (record-type-fields rtd))))
+
+(define (sqlite3-save-record db rtd-to-table-name record)
+  (define rtd (record-type-descriptor record))
+  (define sql
+    (string-replace-substring
+      (string-replace-substring
+        (string-replace-substring
+          (string-append
+            "insert or replace "
+            "into {table} "
+            "{col-list} "
+            "values "
+            "{placeholders-list}")
+          "{table}" (rtd-to-table-name rtd))
+        "{col-list}" (sql-insert-col-list (record-type-fields rtd)))
+      "{placeholders-list}"
+      (sql-insert-placeholders-list (record-type-fields rtd))))
+  (define pars (pars-list record))
+  (sqlite3-execute-sql db sql pars))
 
