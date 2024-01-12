@@ -261,7 +261,7 @@
        (lambda (cols row)
          (set! rows (cons row rows)))
        db sql pars)
-     rows)))
+     (reverse rows))))
 
 (define (obj->string obj)
   (call-with-output-string
